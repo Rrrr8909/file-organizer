@@ -33,29 +33,28 @@ type FileStats struct {
 }
 
 type FileOrganizer struct {
-	sourceDir          string
-	rules              map[string]string
-	processedFiles     int
-	processedFilesSize int64
-	logFile            *os.File
-	statistics         map[string]*FileStats
+	sourceDir      string
+	rules          map[string]string
+	processedFiles int
+	logFile        *os.File
+	logger         *log.Logger
+	statistics     map[string]*FileStats
 }
 
-func NewFileOrganizer(sourceDir string) *FileOrganizer {
+func NewFileOrganizer(sourceDir string) (*FileOrganizer, error) {
 	file, err := os.OpenFile("organizer.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	log.SetOutput(file)
 
 	return &FileOrganizer{
-		sourceDir:          sourceDir,
-		rules:              DefaultRules,
-		processedFiles:     0,
-		processedFilesSize: 0,
-		logFile:            file,
-		statistics:         make(map[string]*FileStats),
-	}
+		sourceDir:      sourceDir,
+		rules:          DefaultRules,
+		processedFiles: 0,
+		logFile:        file,
+		logger:         log.New(file, "", log.LstdFlags),
+		statistics:     make(map[string]*FileStats),
+	}, nil
 }
 
 func (fo *FileOrganizer) Close() error {
@@ -66,19 +65,31 @@ func (fo *FileOrganizer) Close() error {
 }
 
 func (fo *FileOrganizer) logSuccess(message string) {
-	log.Printf("%s [SUCCESS] %s", time.Now().Format("2006/01/02 15:04:05"), message)
+	fo.logger.Printf("[SUCCESS] %s", message)
 }
 
 func (fo *FileOrganizer) logError(message string) {
-	log.Printf("%s [ERROR] %s", time.Now().Format("2006/01/02 15:04:05"), message)
+	fo.logger.Printf("[ERROR] %s", message)
 }
 
 func (fo *FileOrganizer) moveFile(sourcePath, targetDir string) error {
+	targetDir = filepath.Join(fo.sourceDir, targetDir)
+
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return err
 	}
 
-	targetPath := filepath.Join(targetDir, filepath.Base(sourcePath))
+	baseName := filepath.Base(sourcePath)
+	ext := filepath.Ext(baseName)
+
+	targetPath := filepath.Join(targetDir, baseName)
+
+	if _, err := os.Stat(targetPath); err == nil {
+		baseName = fmt.Sprintf("%s_%s%s", baseName[:len(baseName)-len(ext)], time.Now().Format("2006-01-02_15-04-05"), ext)
+		targetPath = filepath.Join(targetDir, baseName)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 
 	err := os.Rename(sourcePath, targetPath)
 	if err != nil {
@@ -89,26 +100,39 @@ func (fo *FileOrganizer) moveFile(sourcePath, targetDir string) error {
 }
 
 func (fo *FileOrganizer) Organize() error {
-	err := filepath.Walk(fo.sourceDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+
+	files, err := os.ReadDir(fo.sourceDir)
+	if err != nil {
+		fo.logError(fmt.Sprintf("error reading source directory: %s", err))
+		return err
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
 		}
 
-		if info.IsDir() {
-			return nil
+		info, err := file.Info()
+		if err != nil {
+			fo.logError(fmt.Sprintf("error reading file: %s", err))
+			continue
 		}
-		ext := filepath.Ext(info.Name())
+
+		name := file.Name()
+		ext := filepath.Ext(name)
+
+		path := filepath.Join(fo.sourceDir, name)
 
 		targetDir, ok := fo.rules[ext]
 		if !ok {
 			fo.logError(fmt.Sprintf("%s: extension %s not supported", path, ext))
-			return nil
+			continue
 		}
 
 		err = fo.moveFile(path, targetDir)
 		if err != nil {
 			fo.logError(fmt.Sprintf("move error %s -> %s: %v", path, targetDir, err))
-			return err
+			continue
 		}
 
 		fs, ok := fo.statistics[targetDir]
@@ -120,16 +144,8 @@ func (fo *FileOrganizer) Organize() error {
 		fs.TotalSize += info.Size()
 
 		fo.processedFiles++
-		fo.processedFilesSize += info.Size()
 
 		fo.logSuccess(fmt.Sprintf("moved: %s -> %s", path, targetDir))
-
-		return nil
-	})
-
-	if err != nil {
-		fo.logError(fmt.Sprintf("error reading source directory: %s", err))
-		return err
 	}
 
 	return nil
@@ -138,23 +154,30 @@ func (fo *FileOrganizer) Organize() error {
 func (fo *FileOrganizer) Report() {
 	fmt.Printf("=== Отчет о перемещении файлов === \n\n")
 	fmt.Printf("Всего обработано файлов: %d \n", fo.processedFiles)
-	fmt.Printf("Общий размерЖ: %d B \n\n", fo.processedFilesSize)
+	var totalSize int64
+	for _, v := range fo.statistics {
+		totalSize += v.TotalSize
+	}
+	fmt.Printf("Общий размер: %.1f MB \n\n", float64(totalSize)/1024/1024)
 
 	fmt.Println("Статистика по категориям: ")
 	for k, v := range fo.statistics {
-		fmt.Printf("%s: \n - Количество файлов: %1d \n - Общий размер: %d B \n", k, v.Count, v.TotalSize)
+		fmt.Printf("%s: \n - Количество файлов: %d \n - Общий размер: %.1f MB \n", k, v.Count, float64(v.TotalSize)/1024/1024)
 	}
 }
-func getUserInput(r *bufio.Reader) string {
+func getUserInput(r *bufio.Reader) (string, error) {
 	line, err := r.ReadString('\n')
 	if err != nil {
-		if err == io.EOF && strings.TrimSpace(line) == "" {
-			return ""
+		if err == io.EOF {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				return "", io.EOF
+			}
+			return line, nil
 		}
-		panic(err)
+		return "", err
 	}
-
-	return strings.TrimSpace(line)
+	return strings.TrimSpace(line), nil
 }
 
 func main() {
@@ -164,25 +187,37 @@ func main() {
 	for {
 		fmt.Println("Введите путь к неструктурированной директории: ")
 
-		dir := getUserInput(in)
+		dir, err := getUserInput(in)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			fmt.Println("Ошибка ввода: ", err)
+			continue
+		}
 		if dir == "" {
-			fmt.Println("Конец программы")
 			break
 		}
-		fo := NewFileOrganizer(dir)
-
-		fmt.Println("Начинаем структурировать файлы по папкам...")
-		err := fo.Organize()
+		fo, err := NewFileOrganizer(dir)
 		if err != nil {
-			fmt.Println(err)
+			log.Fatal(err)
 		}
 
-		fmt.Println("Конец работы")
-		fo.Report()
+		fmt.Println("Начинаем структурировать файлы по папкам...")
+		err = fo.Organize()
+		if err != nil {
+			fmt.Println(err)
+		} else {
+			fmt.Println("Конец работы")
+			fo.Report()
+		}
 
 		err = fo.Close()
 		if err != nil {
-			panic(err)
+			fmt.Println(err)
 		}
+		fmt.Println()
 	}
+
+	fmt.Println("Конец программы")
 }
