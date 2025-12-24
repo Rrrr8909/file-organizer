@@ -168,16 +168,23 @@ func (fo *FileOrganizer) Report() {
 func getUserInput(r *bufio.Reader) (string, error) {
 	line, err := r.ReadString('\n')
 	if err != nil {
-		if err == io.EOF {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				return "", io.EOF
-			}
-			return line, nil
-		}
 		return "", err
 	}
 	return strings.TrimSpace(line), nil
+}
+
+func validateDir(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("Директория не существует: %s", dir)
+		}
+		return fmt.Errorf("Не удалось проверить директорию %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("Указанный путь не является директорией: %s", dir)
+	}
+	return nil
 }
 
 func main() {
@@ -195,9 +202,21 @@ func main() {
 			fmt.Println("Ошибка ввода: ", err)
 			continue
 		}
-		if dir == "" {
-			break
+		if strings.TrimSpace(dir) == "" {
+			dir, err = os.Getwd()
+			if err != nil {
+				fmt.Println("Ошибка получения текущей директории: ", err)
+				continue
+			}
+			fmt.Println("Используется текущая директория по абсолютному пути: ", dir)
 		}
+
+		err = validateDir(dir)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+
 		fo, err := NewFileOrganizer(dir)
 		if err != nil {
 			log.Fatal(err)
